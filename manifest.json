@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-gdocs-sync",
+  "name": "Google Docs Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Two-way sync between your Obsidian vault and Google Docs with rich formatting conversion.",
+  "author": "Tim Broder",
+  "isDesktopOnly": true
+}
