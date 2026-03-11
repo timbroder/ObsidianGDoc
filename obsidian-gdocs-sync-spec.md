@@ -61,7 +61,8 @@ This section documents the highest-risk areas of the project, ordered by severit
   - Validate conversion output length — if output is significantly shorter than input, warn before writing.
   - Always keep ancestor snapshots — never delete until the next successful sync creates a new one.
   - Snapshot + compare strategy for mid-sync edits (see Edge Cases below).
-  - Never auto-resolve a conflict that would delete more than 20% of a file's content — always prompt.
+  - Never auto-resolve a conflict that would delete more than 20% of a file's content (measured against the longer of the two inputs) — always prompt.
+  - Push updates to existing Google Docs as a single atomic `batchUpdate` request (delete range + insert) rather than separate clear-then-rebuild calls, to avoid a window where the doc is empty if the plugin crashes mid-operation.
 
 ### RISK 6: OAuth Token Security (MEDIUM)
 - **Problem:** Refresh tokens stored on disk could be extracted by malware or other plugins.
@@ -71,7 +72,11 @@ This section documents the highest-risk areas of the project, ordered by severit
 - **Problem:** Google Docs document properties have size limits (~30KB). Extremely large frontmatter blocks could exceed this.
 - **Mitigation:** If frontmatter exceeds the property size limit, split across multiple properties with a continuation scheme. Log a warning. In practice, frontmatter rarely exceeds a few KB.
 
-### RISK 8: Multi-Device Sync (OUT OF SCOPE — MVP)
+### RISK 8: `drive.file` Scope Limits Visibility (MEDIUM)
+- **Problem:** The `drive.file` OAuth scope only grants access to files the plugin itself created. If a collaborator or another app places a Google Doc in the synced Drive folder, the plugin cannot see or sync it. Similarly, if a user manually creates a Doc in the folder via the Drive web UI, it won't appear.
+- **Decision:** This is the correct trade-off — broader scopes (e.g., full `drive` scope) would expose the user's entire Drive to the plugin, which is unacceptable for trust. Document this limitation clearly in user-facing docs: only files created by the plugin are synced. Users who want to import an existing Google Doc into the sync should copy it into the synced folder using the plugin's UI (future enhancement) or recreate it from markdown.
+
+### RISK 9: Multi-Device Sync (OUT OF SCOPE — MVP)
 - **Problem:** Two Obsidian instances (e.g., laptop and phone) syncing to the same Drive folder creates a distributed consensus problem. Each device has its own index.json with its own state. Conflicting ancestor snapshots, duplicate pushes, and split-brain scenarios are likely.
 - **Decision:** Multi-device via this plugin is **explicitly unsupported in MVP**. Document this clearly. Users who need multi-device should use Obsidian Sync or a separate Drive sync solution for the vault itself, with only one device running this plugin.
 
@@ -96,7 +101,7 @@ This section documents the highest-risk areas of the project, ordered by severit
 - If both sides changed in non-overlapping regions → auto-merge.
 - If both sides changed the same region → prompt the user with a diff view to choose or manually merge.
 - Merge operations happen at the **markdown level** — the Google Doc is exported to markdown for diffing, then the resolved markdown is converted back and pushed.
-- **Safety rule:** If auto-merge would result in deleting more than 20% of a file's content, always prompt the user instead of auto-applying.
+- **Safety rule:** If the merged result is less than 80% of the length of the **longer** of the two inputs (local and remote), always prompt the user instead of auto-applying. (This is the "20% content-loss threshold" referenced elsewhere in this spec.)
 
 ### 4. Sync Timing
 - **Hybrid:**
@@ -125,7 +130,7 @@ This section documents the highest-risk areas of the project, ordered by severit
 - **Frontmatter** is preserved separately:
   - Stored as a **Google Docs document property** (custom metadata key: `obsidian_frontmatter`).
   - If frontmatter exceeds the property size limit (30KB), overflow is stored in continuation properties (`obsidian_frontmatter_1`, `obsidian_frontmatter_2`, etc.).
-  - Frontmatter is **never visible** in the Google Doc body.
+  - Frontmatter is **never visible** in the Google Doc body and **cannot be edited from Google Docs**. Document properties are not exposed in the Google Docs UI. Frontmatter (tags, aliases, dates, custom fields) is only editable in Obsidian. This must be documented clearly for users who collaborate with non-Obsidian users.
   - On sync back to Obsidian, frontmatter is restored from the document property.
 
 - **Obsidian-specific syntax** is converted to best-effort equivalents:
@@ -180,7 +185,7 @@ This section documents the highest-risk areas of the project, ordered by severit
 ### 9. Exclusions
 The following are **never synced**:
 - `.obsidian/` configuration folder
-- Template folders (detected from Obsidian core plugin settings for Templates and Templater)
+- Template folders (detected from Obsidian core plugin settings for Templates and Templater). If no template plugin is active, no template folder is excluded — do not fall back to a default folder name.
 - Hidden files and folders (any path component starting with `.`)
 - `.canvas` files (always excluded)
 - User-defined exclusion patterns (glob syntax, configured in plugin settings)
@@ -198,7 +203,6 @@ All sync metadata lives in **`.gdocs-sync/`** at the vault root (a hidden folder
 │   ├── <sync_id_1>.md
 │   ├── <sync_id_2>.md
 │   └── ...
-├── queue.json             # Offline change queue (pending operations)
 └── sync.log               # Rolling sync log (last 1000 entries)
 ```
 
@@ -229,24 +233,6 @@ All sync metadata lives in **`.gdocs-sync/`** at the vault root (a hidden folder
 }
 ```
 
-**`queue.json` schema:**
-```json
-{
-  "version": 1,
-  "pending": [
-    {
-      "id": "<operation-uuid>",
-      "type": "PUSH|PULL|DELETE|RENAME|MOVE",
-      "syncId": "<file-sync-uuid>",
-      "localPath": "folder/note.md",
-      "timestamp": "2025-03-10T12:00:00Z",
-      "snapshotHash": "<sha256 of file at time of queue>",
-      "metadata": {}
-    }
-  ]
-}
-```
-
 ### 11. UI
 
 #### Ribbon Icon
@@ -258,16 +244,16 @@ All sync metadata lives in **`.gdocs-sync/`** at the vault root (a hidden folder
 - Bottom status bar item showing sync state:
   - "GDocs: Synced ✓" (idle, all synced)
   - "GDocs: Syncing..." (active sync)
-  - "GDocs: 3 pending" (changes queued)
+  - "GDocs: 3 pending" (dirty files awaiting next sync)
   - "GDocs: 1 conflict" (needs user attention)
   - "GDocs: Error" (last sync failed)
-  - "GDocs: Offline (5 queued)" (no internet, changes queued)
+  - "GDocs: Offline (5 pending)" (no internet, dirty files tracked in memory)
 
 #### Sync Log
 - Accessible from the command palette: `GDocs Sync: View Sync Log`
 - Opens a modal or leaf panel showing the rolling log with timestamps, actions, and any errors.
 - Log entries: `[timestamp] [action] [file] [result]`
-  - Actions: PUSH, PULL, MERGE, CONFLICT, DELETE, RENAME, MOVE, ERROR, QUEUE, SKIP, CONVERSION_FAIL
+  - Actions: PUSH, PULL, MERGE, CONFLICT, DELETE, RENAME, MOVE, ERROR, SKIP, CONVERSION_FAIL
 - Log is stored in `.gdocs-sync/sync.log`, capped at 1000 entries (FIFO).
 
 #### Conflict Resolution Modal
@@ -299,7 +285,7 @@ All sync metadata lives in **`.gdocs-sync/`** at the vault root (a hidden folder
 
 ### Offline Behavior
 - When no internet connection is detected, sync attempts during polling intervals are silently skipped.
-- Changes made locally while offline are tracked via file hash comparison on the next successful sync cycle. No separate offline queue is needed for auto-push-on-save changes — the hash comparison catches them.
+- Changes made locally while offline are tracked via the in-memory dirty-files set (populated by Obsidian vault events) and verified by hash comparison on the next successful sync cycle. No separate offline queue file is needed.
 - If a manual sync is triggered while offline, display a notice: "No internet connection. Changes will sync when connectivity is restored."
 - The status bar shows "GDocs: Offline" when the network is unavailable.
 
@@ -323,15 +309,18 @@ All sync metadata lives in **`.gdocs-sync/`** at the vault root (a hidden folder
 - If a file is renamed and then edited within the debounce window, both the rename and the content change are applied as a single sync operation.
 - If a file is created and deleted within the debounce window, no sync operation occurs.
 
-### External File Changes (Outside Obsidian)
-- Changes made to vault files outside of Obsidian (e.g., via git, scripts, other editors) are detected on the next sync cycle via SHA-256 hash comparison.
-- On each sync cycle, the plugin hashes every tracked file and compares to the stored `localContentHash` in index.json.
-- If the hash differs, the file is treated as locally modified and synced accordingly.
+### Local Change Detection
+- The plugin listens to Obsidian vault events (`vault.on('modify')`, `vault.on('create')`, `vault.on('delete')`, `vault.on('rename')`) and maintains an in-memory **dirty-files set** of paths that have changed since the last sync.
+- On each periodic sync cycle, only files in the dirty set are hashed and compared — not the entire vault. This makes periodic sync O(changed files) instead of O(all files).
+- A **full vault hash scan** is performed in these cases only:
+  - On plugin startup (to catch changes made while the plugin was not running, e.g., via git, scripts, or other editors).
+  - On manual sync (belt-and-suspenders — ensures nothing is missed).
+- If a full scan finds a hash mismatch for a file not in the dirty set, the file is treated as locally modified and synced accordingly.
 
 ### Mid-Sync Race Condition
 - Before pushing a file, the plugin takes a SHA-256 hash of the file contents ("pre-push snapshot").
 - After the push completes successfully, the plugin re-hashes the file.
-- If the hash has changed (user edited during push), the file is immediately queued for another sync cycle.
+- If the hash has changed (user edited during push), the file is added to the dirty set for the next sync cycle.
 - This avoids both file locking (bad UX) and optimistic concurrency (data loss risk).
 
 ### Google Docs Formatting Without Markdown Equivalents
@@ -345,9 +334,10 @@ All sync metadata lives in **`.gdocs-sync/`** at the vault root (a hidden folder
 
 ### Rename Conflicts
 - If a file is renamed on both sides to different names since the last sync:
-  - The Google Docs name takes precedence (since collaborators may have shared the link with the new name).
+  - The Google Docs **filename** takes precedence (since collaborators may have shared the link with the new name).
   - The user is notified: "Note 'old-name' was renamed to 'gdoc-name' (renamed in Google Docs). Your local name 'local-name' was overridden."
   - This is a pragmatic choice — revisit if users report issues.
+- **Rename + move conflict:** If one side renames the file and the other side moves it to a different folder, both operations are applied independently. The result uses the remote filename and the local folder path (or vice versa, depending on which side did which). For example: local moves `notes/foo.md` → `archive/foo.md`, remote renames to "bar" → result is `archive/bar.md`.
 
 ### Folder Deletion
 - If a vault folder is deleted and it contained synced files:
@@ -371,7 +361,7 @@ All sync metadata lives in **`.gdocs-sync/`** at the vault root (a hidden folder
   - All sync operations halt.
   - Status bar shows "GDocs: Auth Required".
   - A notice prompts the user to re-authenticate in settings.
-  - Queued changes are preserved and will sync after re-authentication.
+  - Dirty files are tracked in memory and will sync after re-authentication.
 
 ---
 
@@ -407,7 +397,10 @@ function syncAll():
      - Fallback: if no startPageToken, list all files in root folder (recursive)
 
   2. Compute local state:
-     - For each file tracked in index.json:
+     - Drain the in-memory dirty-files set (populated by vault events since last sync)
+     - For timer-based sync: only hash files in the dirty set + check for deleted tracked files
+     - For manual sync or startup: full vault hash scan (all tracked files)
+     - For each file to check:
        a. Check if file still exists on disk
        b. Compute SHA-256 hash of current contents
        c. Compare hash to stored localContentHash → local changed?
@@ -439,12 +432,13 @@ function syncAll():
      b. Read .md file, extract frontmatter
      c. Convert markdown → Google Docs format
      d. If conversion fails → push as plain text, flag as conversionFailed
-     e. Update Google Doc via Docs API (batchUpdate)
-     f. Store frontmatter as document property
-     g. Re-hash local file (post-push hash)
-     h. If post-push hash ≠ pre-push hash → queue for re-sync
-     i. Update ancestor snapshot
-     j. Update index.json entry
+     e. If existing doc: send a single atomic batchUpdate that deletes all content then inserts new content (no separate clear step — avoids empty-doc window on crash)
+     f. If new doc: create via Drive API, then apply batchUpdate
+     g. Store frontmatter as document property
+     h. Re-hash local file (post-push hash)
+     i. If post-push hash ≠ pre-push hash → add to dirty set for next sync cycle
+     j. Update ancestor snapshot
+     k. Update index.json entry
 
   6. For each PULL operation:
      a. Fetch Google Doc content via Docs API
@@ -460,7 +454,7 @@ function syncAll():
      c. If ancestor missing → treat entire file as conflict, prompt user
      d. Run three-way merge (ancestor, local, remote)
      e. If clean merge:
-        - Validate: if merged result is <80% length of larger input, prompt instead
+        - Validate: apply the 20% content-loss threshold (see Conflict Resolution safety rule) — if merged result is <80% length of the longer of the two inputs, prompt instead
         - Apply merged result to both sides (write local, push to Google Doc)
      f. If conflict → show conflict resolution modal, wait for user
      g. Update ancestor snapshot with resolved version
@@ -490,8 +484,7 @@ PUSH (Obsidian → Google Docs):
      - Each AST node maps to insertText + updateTextStyle + updateParagraphStyle calls
      - Build requests in document order with correct indexing
   6. If new doc: create via Drive API, then apply batchUpdate
-  7. If existing doc: clear content, then apply batchUpdate
-     (Alternative: compute diff of current doc vs desired content — complex but more efficient)
+  7. If existing doc: send a single batchUpdate that deletes all body content (except the required trailing newline) then inserts the new content. This is atomic — no window where the doc is empty.
   8. Set document properties (frontmatter, sync_id)
 
 PULL (Google Docs → Obsidian):
@@ -515,14 +508,14 @@ PULL (Google Docs → Obsidian):
 ### Rate Limiting & Performance
 - Batch Drive API calls where possible (batch endpoint supports up to 100 calls per batch).
 - Debounce rapid saves (configurable, default 5s).
-- Queue sync operations — never run concurrent syncs. Use a mutex/lock.
+- Serialize sync operations — never run concurrent syncs. Use a mutex/lock.
 - Respect Google API quotas: Drive API (12,000 requests/min), Docs API (300 requests/min per user).
 - For large vaults (1000+ files), use incremental sync via Drive change tokens (`changes.list` API with `startPageToken`).
 - Hash computation for change detection: SHA-256 on all tracked files. For a 1000-file vault of text files, this takes well under 1 second.
 - Initial sync: process in batches of 50 files with 1-second delay between batches to stay within rate limits.
 
 ### Error Handling
-- Network errors → retry with exponential backoff (3 attempts: 1s, 4s, 16s), then mark as pending in queue.json.
+- Network errors → retry with exponential backoff (3 attempts: 1s, 4s, 16s), then skip file (dirty set preserves it for next cycle).
 - Auth token expired → auto-refresh using refresh token. If refresh fails, halt sync and prompt re-auth.
 - API quota exceeded → back off for 60 seconds, notify user via status bar, retry.
 - HTTP 429 (rate limited) → respect Retry-After header.
@@ -557,7 +550,7 @@ obsidian-gdocs-sync/
 │   │   ├── index-manager.ts         # index.json read/write/query (atomic writes)
 │   │   ├── change-detector.ts       # Hash-based local change detection
 │   │   ├── merge.ts                 # Three-way merge logic
-│   │   ├── queue.ts                 # Offline operation queue (queue.json)
+│   │   ├── dirty-tracker.ts          # In-memory dirty-files set (vault event listener)
 │   │   ├── conflict-modal.ts        # Conflict resolution UI
 │   │   └── sync-log.ts              # Sync log manager
 │   ├── google/
@@ -595,7 +588,7 @@ obsidian-gdocs-sync/
 │   │   │   ├── change-detector.test.ts
 │   │   │   ├── merge.test.ts
 │   │   │   ├── index-manager.test.ts
-│   │   │   └── queue.test.ts
+│   │   │   └── dirty-tracker.test.ts
 │   │   ├── google/
 │   │   │   ├── auth.test.ts
 │   │   │   ├── rate-limiter.test.ts
@@ -920,18 +913,18 @@ Test cases:
 - Query: find all files with conversionFailed=true
 ```
 
-#### `queue.test.ts`
+#### `dirty-tracker.test.ts`
 ```
 Test cases:
-- Add operation to empty queue
-- Add multiple operations
-- Dequeue operations in FIFO order
-- Clear queue after successful sync
-- Persist queue to disk (queue.json)
-- Load queue from disk
-- Deduplicate: same file queued twice → keep latest
-- Queue survives plugin restart (read from disk)
-- Empty queue → returns empty array
+- Vault modify event → file added to dirty set
+- Vault create event → file added to dirty set
+- Vault delete event → file added to dirty set (with deleted flag)
+- Vault rename event → old path marked deleted, new path marked dirty
+- Multiple edits to same file → only one entry in dirty set
+- Drain dirty set → returns all dirty paths and clears the set
+- Drain returns empty set when nothing changed
+- Exclusion patterns respected — excluded file events are ignored
+- Hidden files (dotfiles) events are ignored
 ```
 
 ### Unit Tests — Google Module
@@ -1032,9 +1025,9 @@ Scenarios:
 - Steady-state: different files changed on each side → parallel PUSH + PULL
 - Steady-state: same file changed on both sides, non-overlapping → auto-merge
 - Steady-state: same file changed on both sides, conflicting → conflict modal shown
-- Sync lock: second sync attempt while first is running → queued or rejected
+- Sync lock: second sync attempt while first is running → skipped (dirty set preserves changes for next cycle)
 - Error during sync: one file fails, others succeed → partial sync, error logged
-- Network failure mid-sync → operations queued, status bar updated
+- Network failure mid-sync → dirty set preserved, status bar updated
 ```
 
 #### `push-pull-cycle.test.ts`
@@ -1217,12 +1210,13 @@ The modules should be built and tested in this order. Each phase produces a test
 2. **Glob utility (glob.ts):** Exclusion pattern matching
 3. **Index manager (index-manager.ts):** CRUD operations with atomic writes
 4. **Change detector (change-detector.ts):** Local hash comparison
-5. **Sync planner (planner.ts):** Build operation plan from state comparison
-6. **Sync executor (executor.ts):** Execute planned operations in correct order
-7. **Sync engine (engine.ts):** Orchestrate full sync cycle (push + pull)
-8. **Ribbon icon and status bar:** Basic UI feedback
+5. **Dirty tracker (dirty-tracker.ts):** Vault event listener, in-memory dirty-files set
+6. **Sync planner (planner.ts):** Build operation plan from state comparison
+7. **Sync executor (executor.ts):** Execute planned operations in correct order
+8. **Sync engine (engine.ts):** Orchestrate full sync cycle (push + pull)
+9. **Ribbon icon and status bar:** Basic UI feedback
 
-**Tests:** planner.test.ts, change-detector.test.ts, index-manager.test.ts, push-pull-cycle.test.ts
+**Tests:** planner.test.ts, change-detector.test.ts, dirty-tracker.test.ts, index-manager.test.ts, push-pull-cycle.test.ts
 **Deliverable:** Working one-directional sync (push local changes, pull remote changes, but not yet handling conflicts).
 
 ### Phase 4: Two-Way Sync & Conflict Resolution (Week 9-11)
@@ -1243,13 +1237,12 @@ The modules should be built and tested in this order. Each phase produces a test
 1. **Deletion handling:** Move to deleted folder, prompt on remote deletion
 2. **Rename/move sync:** UUID-based identity tracking, both directions
 3. **Initial sync modal:** Direction chooser, progress bar, batch processing
-4. **Offline handling:** Network detection, queue management
-5. **Queue module (queue.ts):** Persist pending operations across restarts
-6. **Large file skip logic:** Size threshold check
-7. **Conversion failure fallback:** Plain text push with warning
-8. **Index recovery:** Rebuild from Drive properties
+4. **Offline handling:** Network detection, dirty-set preservation
+5. **Large file skip logic:** Size threshold check
+6. **Conversion failure fallback:** Plain text push with warning
+7. **Index recovery:** Rebuild from Drive properties
 
-**Tests:** deletion-lifecycle.test.ts, rename-move.test.ts, initial-sync.test.ts, queue.test.ts
+**Tests:** deletion-lifecycle.test.ts, rename-move.test.ts, initial-sync.test.ts, dirty-tracker.test.ts
 **Deliverable:** Complete, production-ready sync with all edge cases handled.
 
 ### Phase 6: Polish & Documentation (Week 14)
@@ -1263,6 +1256,9 @@ The modules should be built and tested in this order. Each phase produces a test
 6. **Final integration testing:** Full sync-engine.test.ts suite
 
 **Deliverable:** v0.1 release candidate.
+
+### Timeline Note
+The above timeline is aspirational. Phase 2 (conversion engine) is identified as the highest-risk module in the risk register and may take significantly longer than 3 weeks due to round-trip fidelity challenges. Plan conservatively — 18-22 weeks total is more realistic for a solo developer.
 
 ---
 
@@ -1288,12 +1284,11 @@ The modules should be built and tested in this order. Each phase produces a test
 - Status bar indicator with all states
 - Sync log (accessible from command palette)
 - Initial sync direction chooser with progress bar
-- Offline change detection via hash comparison
+- Event-driven local change detection with full hash scan on startup
 - Large file skip with configurable threshold
 - Conversion failure fallback (plain text push)
 - Index corruption recovery
 - Mid-sync edit protection (snapshot + compare)
-- External file change detection (hash-based)
 - Google Docs-only formatting preserved as HTML in markdown
 
 ### Explicitly Out of Scope for MVP
