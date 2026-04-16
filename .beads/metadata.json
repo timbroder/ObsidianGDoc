@@ -1,4 +1,7 @@
 {
-  "database": "beads.db",
-  "jsonl_export": "issues.jsonl"
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "ObsidianGDoc",
+  "project_id": "df83d786-7f7e-451a-92cc-ad3aa5ae9ef1"
 }
