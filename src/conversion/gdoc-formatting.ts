@@ -1,9 +1,4 @@
-import type { GoogleDocTextStyle } from "@/types";
-import {
-  HIGHLIGHT_BG_COLOR,
-  CODE_BLOCK_BG_COLOR,
-  MONOSPACE_FONTS,
-} from "@/constants";
+import { HIGHLIGHT_BG_COLOR } from "@/constants";
 
 /**
  * Convert Google Docs RGB color (0-1 floats) to a hex string like "#FF0000".

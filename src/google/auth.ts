@@ -41,8 +41,9 @@ export class GoogleAuth {
 
   /**
    * Generate the OAuth 2.0 authorization URL with correct scopes and redirect.
+   * Pass a PKCE code challenge (S256) for the installed-app flow.
    */
-  getAuthUrl(state?: string): string {
+  getAuthUrl(state?: string, codeChallenge?: string): string {
     const params = new URLSearchParams({
       client_id: this.clientId,
       redirect_uri: this.redirectUri,
@@ -55,14 +56,20 @@ export class GoogleAuth {
     if (state) {
       params.set("state", state);
     }
+    if (codeChallenge) {
+      params.set("code_challenge", codeChallenge);
+      params.set("code_challenge_method", "S256");
+    }
 
     return `${GOOGLE_AUTH_URL}?${params.toString()}`;
   }
 
   /**
    * Exchange an authorization code for access and refresh tokens.
+   * `codeVerifier` is the PKCE verifier matching the challenge sent in the
+   * authorization URL.
    */
-  async exchangeCode(code: string): Promise<OAuthTokens> {
+  async exchangeCode(code: string, codeVerifier?: string): Promise<OAuthTokens> {
     const body = new URLSearchParams({
       code,
       client_id: this.clientId,
@@ -70,10 +77,14 @@ export class GoogleAuth {
       redirect_uri: this.redirectUri,
       grant_type: "authorization_code",
     });
+    if (codeVerifier) {
+      body.set("code_verifier", codeVerifier);
+    }
 
     const response = await requestUrl({
       url: GOOGLE_TOKEN_URL,
       method: "POST",
+      throw: false,
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
       },
@@ -138,6 +149,7 @@ export class GoogleAuth {
     const response = await requestUrl({
       url: GOOGLE_TOKEN_URL,
       method: "POST",
+      throw: false,
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
       },
@@ -186,6 +198,7 @@ export class GoogleAuth {
     const response = await requestUrl({
       url: `${GOOGLE_REVOKE_URL}?token=${encodeURIComponent(tokenToRevoke)}`,
       method: "POST",
+      throw: false,
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
       },
@@ -214,8 +227,11 @@ export class GoogleAuth {
     }
 
     const encrypted = encryptTokens(this.tokens, passphrase);
-    const { writeFile } = await import("fs/promises");
-    await writeFile(filePath, JSON.stringify(encrypted), "utf-8");
+    const { mkdir } = await import("fs/promises");
+    const path = await import("path");
+    const { atomicWriteFile } = await import("@/utils/atomic-write");
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await atomicWriteFile(filePath, JSON.stringify(encrypted));
   }
 
   /**
@@ -253,6 +269,35 @@ export class GoogleAuth {
   getTokens(): OAuthTokens | null {
     return this.tokens ? { ...this.tokens } : null;
   }
+}
+
+// ============================================================
+// PKCE helpers
+// ============================================================
+
+export interface PkcePair {
+  verifier: string;
+  challenge: string;
+}
+
+function base64UrlEncode(buffer: Buffer): string {
+  return buffer
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+/**
+ * Generate a PKCE code verifier and its S256 challenge for the OAuth
+ * installed-app flow.
+ */
+export function generatePkcePair(): PkcePair {
+  const verifier = base64UrlEncode(crypto.randomBytes(32));
+  const challenge = base64UrlEncode(
+    crypto.createHash("sha256").update(verifier).digest(),
+  );
+  return { verifier, challenge };
 }
 
 // ============================================================

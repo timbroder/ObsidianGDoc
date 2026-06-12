@@ -47,8 +47,9 @@ describe("RateLimiter", () => {
       expect(results).toEqual([0, 1, 2]);
       expect(limiter.getPendingCount()).toBe(2);
 
-      // Advance past the window so the oldest timestamps expire
-      await jest.advanceTimersByTimeAsync(windowMs);
+      // Advance just past the window so the oldest timestamps expire (a
+      // slot opens strictly after a timestamp leaves the inclusive window)
+      await jest.advanceTimersByTimeAsync(windowMs + 1);
       expect(results).toEqual([0, 1, 2, 3, 4]);
       expect(limiter.getPendingCount()).toBe(0);
 
@@ -110,8 +111,8 @@ describe("RateLimiter", () => {
       await jest.advanceTimersByTimeAsync(0);
       expect(executionOrder).toEqual(["a", "b"]);
 
-      // Third must wait for window to pass
-      await jest.advanceTimersByTimeAsync(60_000);
+      // Third must wait for the window to fully pass
+      await jest.advanceTimersByTimeAsync(60_001);
       expect(executionOrder).toEqual(["a", "b", "c"]);
 
       await expect(p1).resolves.toBe("a");
@@ -135,9 +136,9 @@ describe("RateLimiter", () => {
       // Batch 1: items 0, 1
       await jest.advanceTimersByTimeAsync(0);
       // Batch 2: items 2, 3 (after first window)
-      await jest.advanceTimersByTimeAsync(windowMs);
+      await jest.advanceTimersByTimeAsync(windowMs + 1);
       // Batch 3: items 4, 5 (after second window)
-      await jest.advanceTimersByTimeAsync(windowMs);
+      await jest.advanceTimersByTimeAsync(windowMs + 1);
 
       const results = await Promise.all(promises);
       expect(results).toEqual([0, 1, 2, 3, 4, 5]);
@@ -195,12 +196,13 @@ describe("RateLimiter", () => {
       await p1;
       expect(limiter.getPendingCount()).toBe(2);
 
-      // Advance window to let next one through
-      await jest.advanceTimersByTimeAsync(60_000);
+      // Advance just past the window to let next one through (a slot opens
+      // strictly after the oldest timestamp leaves the inclusive window).
+      await jest.advanceTimersByTimeAsync(60_001);
       await p2;
       expect(limiter.getPendingCount()).toBe(1);
 
-      await jest.advanceTimersByTimeAsync(60_000);
+      await jest.advanceTimersByTimeAsync(60_001);
       await p3;
       expect(limiter.getPendingCount()).toBe(0);
     });

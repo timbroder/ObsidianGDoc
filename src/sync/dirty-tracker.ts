@@ -57,6 +57,19 @@ export class DirtyTracker {
     return snapshot;
   }
 
+  /**
+   * Restore previously drained entries after a failed sync so the intent
+   * (especially renames/deletes) isn't lost. Entries dirtied again since the
+   * drain win over the restored ones.
+   */
+  restore(entries: Map<string, DirtyFileEntry>): void {
+    for (const [path, entry] of entries) {
+      if (!this.dirtyFiles.has(path)) {
+        this.dirtyFiles.set(path, entry);
+      }
+    }
+  }
+
   getDirtyPaths(): Set<string> {
     return new Set(this.dirtyFiles.keys());
   }

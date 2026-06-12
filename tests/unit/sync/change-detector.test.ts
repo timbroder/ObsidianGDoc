@@ -14,7 +14,7 @@ describe("ChangeDetector", () => {
   const makeEntry = (overrides: Partial<SyncFileEntry> = {}): SyncFileEntry => ({
     localPath: "test.md",
     driveFileId: "drive-123",
-    googleDocId: "doc-123",
+    
     lastSyncTimestamp: "2025-01-01T00:00:00Z",
     localContentHash: sha256("original content"),
     remoteContentHash: "abc",

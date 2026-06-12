@@ -140,6 +140,7 @@ export function applyResolution(
     case "keep-remote":
       return remote;
     case "open-in-editor":
-      return null; // Signal to caller to open editor
+    case "skip":
+      return null; // Signal to caller: leave both sides unresolved
   }
 }

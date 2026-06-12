@@ -14,6 +14,14 @@ export interface GDocsSyncSettings {
   maxFileSizeMB: number;
   maxLogEntries: number;
   enableDebugLogging: boolean;
+  /**
+   * Random key used to encrypt the OAuth token file at rest.
+   * Generated on first sign-in. Note: this lives in the plugin's data.json,
+   * so the encryption protects the token file when it is synced/backed up
+   * separately from plugin data — it is obfuscation, not a vault against an
+   * attacker with full disk access.
+   */
+  tokenKey: string;
 }
 
 export const DEFAULT_SETTINGS: GDocsSyncSettings = {
@@ -28,6 +36,7 @@ export const DEFAULT_SETTINGS: GDocsSyncSettings = {
   maxFileSizeMB: 5,
   maxLogEntries: 1000,
   enableDebugLogging: false,
+  tokenKey: "",
 };
 
 // ============================================================
@@ -46,10 +55,14 @@ export interface SyncIndex {
 export interface SyncFileEntry {
   localPath: string;
   driveFileId: string;
-  googleDocId: string;
   lastSyncTimestamp: string;
   localContentHash: string;
   remoteContentHash: string;
+  /**
+   * The Drive `modifiedTime` recorded after our last push or pull. Used to
+   * suppress "echo" changes — our own writes reappearing in the changes feed.
+   */
+  lastRemoteModifiedTime?: string;
   isDirectory: boolean;
   mimeType: string;
   conversionFailed: boolean;
@@ -92,6 +105,8 @@ export interface SyncOperation {
   localPath: string;
   remotePath?: string;
   newPath?: string;
+  /** Remote file metadata, present for operations driven by a Drive change. */
+  driveFile?: DriveFile;
 }
 
 export interface SyncPlan {
@@ -141,6 +156,7 @@ export interface DriveFile {
   modifiedTime: string;
   properties?: Record<string, string>;
   size?: string;
+  trashed?: boolean;
 }
 
 export interface DriveChangeList {
@@ -314,7 +330,8 @@ export interface DirtyFileEntry {
 export type ConflictResolution =
   | "keep-local"
   | "keep-remote"
-  | "open-in-editor";
+  | "open-in-editor"
+  | "skip";
 
 // ============================================================
 // Sync Status

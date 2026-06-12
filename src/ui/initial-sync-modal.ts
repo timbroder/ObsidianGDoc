@@ -35,10 +35,7 @@ export class InitialSyncModal extends Modal {
       });
     }
 
-    const buttonContainer = contentEl.createDiv();
-    buttonContainer.style.display = "flex";
-    buttonContainer.style.gap = "8px";
-    buttonContainer.style.marginTop = "16px";
+    const buttonContainer = contentEl.createDiv({ cls: "gdocs-sync-button-row" });
 
     if (this.vaultFileCount > 0) {
       const pushBtn = buttonContainer.createEl("button", {

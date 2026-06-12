@@ -1,11 +1,16 @@
-import { RATE_LIMIT_WINDOW_MS } from "../constants";
+import { RATE_LIMIT_WINDOW_MS, MAX_RETRIES, RETRY_DELAYS_MS } from "../constants";
 
 export class RateLimitError extends Error {
   status: number;
-  retryAfter: number;
+  /** Server-provided Retry-After in seconds, if any. */
+  retryAfter?: number;
 
-  constructor(retryAfter: number) {
-    super(`Rate limited. Retry after ${retryAfter}ms`);
+  constructor(retryAfter?: number) {
+    super(
+      retryAfter !== undefined
+        ? `Rate limited. Retry after ${retryAfter}s`
+        : "Rate limited.",
+    );
     this.name = "RateLimitError";
     this.status = 429;
     this.retryAfter = retryAfter;
@@ -80,7 +85,9 @@ export class RateLimiter {
 
   private pruneTimestamps(now: number): void {
     const windowStart = now - this.windowMs;
-    while (this.requestTimestamps.length > 0 && this.requestTimestamps[0] <= windowStart) {
+    // Strictly older than the boundary: a timestamp at exactly
+    // `now - windowMs` is still inside the [now - windowMs, now] window.
+    while (this.requestTimestamps.length > 0 && this.requestTimestamps[0] < windowStart) {
       this.requestTimestamps.shift();
     }
   }
@@ -92,9 +99,11 @@ export class RateLimiter {
       return 0;
     }
 
-    // The oldest timestamp in the window determines when a slot frees up
+    // The oldest timestamp in the window determines when a slot frees up.
+    // A slot opens strictly AFTER the oldest timestamp leaves the inclusive
+    // [now - windowMs, now] window, hence the +1.
     const oldestInWindow = this.requestTimestamps[0];
-    return oldestInWindow + this.windowMs - now;
+    return oldestInWindow + this.windowMs - now + 1;
   }
 
   private async processQueue(): Promise<void> {
@@ -118,34 +127,42 @@ export class RateLimiter {
         const entry = this.queue.shift();
         if (!entry) break;
 
+        // One slot per logical request; retries do not consume extra slots.
         this.requestTimestamps.push(Date.now());
 
-        try {
-          const result = await entry.fn();
-          entry.resolve(result);
-        } catch (error: unknown) {
-          if (this.isRateLimitError(error)) {
-            const retryAfterMs = this.extractRetryAfter(error);
-            await this.delay(retryAfterMs);
-            if (this.cancelled) {
-              entry.reject(new CancellationError());
-              break;
-            }
-            // Re-record the timestamp for the retry
-            this.requestTimestamps.push(Date.now());
-            try {
-              const result = await entry.fn();
-              entry.resolve(result);
-            } catch (retryError: unknown) {
-              entry.reject(retryError);
-            }
-          } else {
-            entry.reject(error);
-          }
-        }
+        await this.runWithRetries(entry);
       }
     } finally {
       this.processing = false;
+    }
+  }
+
+  /**
+   * Execute an entry, retrying up to MAX_RETRIES times on 429 and 5xx
+   * responses. 429s honor the server's Retry-After when provided; otherwise
+   * the exponential RETRY_DELAYS_MS schedule applies.
+   */
+  private async runWithRetries(entry: QueueEntry<unknown>): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        entry.resolve(await entry.fn());
+        return;
+      } catch (error: unknown) {
+        if (!this.isRetryableError(error) || attempt >= MAX_RETRIES) {
+          entry.reject(error);
+          return;
+        }
+
+        const delayMs = this.isRateLimitError(error)
+          ? this.extractRetryAfter(error)
+          : RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
+
+        await this.delay(delayMs);
+        if (this.cancelled) {
+          entry.reject(new CancellationError());
+          return;
+        }
+      }
     }
   }
 
@@ -165,11 +182,25 @@ export class RateLimiter {
     });
   }
 
-  private isRateLimitError(error: unknown): boolean {
-    if (error && typeof error === "object" && "status" in error) {
-      return (error as { status: number }).status === 429;
+  private getErrorStatus(error: unknown): number | undefined {
+    if (
+      error &&
+      typeof error === "object" &&
+      "status" in error &&
+      typeof (error as { status: unknown }).status === "number"
+    ) {
+      return (error as { status: number }).status;
     }
-    return false;
+    return undefined;
+  }
+
+  private isRateLimitError(error: unknown): boolean {
+    return this.getErrorStatus(error) === 429;
+  }
+
+  private isRetryableError(error: unknown): boolean {
+    const status = this.getErrorStatus(error);
+    return status === 429 || (status !== undefined && status >= 500 && status < 600);
   }
 
   private extractRetryAfter(error: unknown): number {

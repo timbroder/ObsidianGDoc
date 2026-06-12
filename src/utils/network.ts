@@ -1,7 +1,6 @@
 import { requestUrl } from "obsidian";
 
 const CONNECTIVITY_URL = "https://www.googleapis.com/generate_204";
-const TIMEOUT_MS = 5000;
 
 /**
  * Check whether the device currently has network connectivity by
@@ -14,6 +13,7 @@ export async function isOnline(): Promise<boolean> {
     const response = await requestUrl({
       url: CONNECTIVITY_URL,
       method: "GET",
+      throw: false,
       headers: {
         "Cache-Control": "no-cache",
       },
