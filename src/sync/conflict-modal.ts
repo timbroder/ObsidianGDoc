@@ -30,11 +30,8 @@ export class ConflictResolutionModal extends Modal {
 
     // Side by side diff
     const diffContainer = contentEl.createDiv({ cls: "gdocs-sync-diff-container" });
-    diffContainer.style.display = "flex";
-    diffContainer.style.gap = "8px";
 
-    const localPane = diffContainer.createDiv();
-    localPane.style.flex = "1";
+    const localPane = diffContainer.createDiv({ cls: "gdocs-sync-diff-pane" });
     localPane.createEl("h3", { text: "Obsidian (local)" });
     const localPre = localPane.createEl("pre", { cls: "gdocs-sync-diff-view" });
     localPre.textContent = this.localContent.substring(0, 5000);
@@ -42,8 +39,7 @@ export class ConflictResolutionModal extends Modal {
       localPre.textContent += "\n... (truncated)";
     }
 
-    const remotePane = diffContainer.createDiv();
-    remotePane.style.flex = "1";
+    const remotePane = diffContainer.createDiv({ cls: "gdocs-sync-diff-pane" });
     remotePane.createEl("h3", { text: "Google Docs (remote)" });
     const remotePre = remotePane.createEl("pre", { cls: "gdocs-sync-diff-view" });
     remotePre.textContent = this.remoteContent.substring(0, 5000);
@@ -52,10 +48,7 @@ export class ConflictResolutionModal extends Modal {
     }
 
     // Buttons
-    const buttonContainer = contentEl.createDiv();
-    buttonContainer.style.display = "flex";
-    buttonContainer.style.gap = "8px";
-    buttonContainer.style.marginTop = "16px";
+    const buttonContainer = contentEl.createDiv({ cls: "gdocs-sync-button-row" });
 
     const keepLocalBtn = buttonContainer.createEl("button", {
       text: "Keep Obsidian Version",
@@ -82,9 +75,9 @@ export class ConflictResolutionModal extends Modal {
   onClose(): void {
     const { contentEl } = this;
     contentEl.empty();
-    // If closed without choosing, default to keep-local
+    // If dismissed without choosing, skip — never silently discard one side.
     if (this.resolvePromise) {
-      this.resolvePromise("keep-local");
+      this.resolvePromise("skip");
       this.resolvePromise = null;
     }
   }

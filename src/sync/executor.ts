@@ -1,21 +1,25 @@
 import { Notice } from "obsidian";
-import { SyncOperation, SyncPlan, SyncFileEntry, BatchUpdateRequest } from "@/types";
+import { SyncOperation, SyncPlan, BatchUpdateRequest } from "@/types";
 import { IndexManager } from "./index-manager";
 import { SyncLog } from "./sync-log";
-import { threeWayMerge, applyResolution, MergeResult } from "./merge";
+import { threeWayMerge, applyResolution } from "./merge";
 import { sha256 } from "@/utils/hash";
-import { DriveAPI } from "@/google/drive";
+import { DriveAPI, DriveFileNotFoundError } from "@/google/drive";
 import { DocsAPI } from "@/google/docs";
 import { markdownToGoogleDoc } from "@/conversion/md-to-gdoc";
 import { googleDocToMarkdown } from "@/conversion/gdoc-to-md";
-import { extractFrontmatter, prependFrontmatter, frontmatterToDocProperties, docPropertiesToFrontmatter } from "@/conversion/frontmatter";
+import {
+  extractFrontmatter,
+  prependFrontmatter,
+  frontmatterToDocProperties,
+  docPropertiesToFrontmatter,
+  FrontmatterTooLargeError,
+} from "@/conversion/frontmatter";
 import { transformAllObsidianSyntax } from "@/conversion/obsidian-syntax";
 import {
   DOC_PROPERTY_SYNC_ID,
-  DOC_PROPERTY_FRONTMATTER,
-  DELETED_FOLDER_NAME,
   GOOGLE_DOC_MIME_TYPE,
-  CONTENT_LOSS_THRESHOLD,
+  GOOGLE_FOLDER_MIME_TYPE,
   ANCESTORS_DIR,
   SYNC_DIR,
 } from "@/constants";
@@ -32,8 +36,19 @@ export interface ExecutorDeps {
   writeFile: (filePath: string, content: string) => Promise<void>;
   deleteFile: (filePath: string) => Promise<void>;
   renameFile: (oldPath: string, newPath: string) => Promise<void>;
-  promptConflict: (local: string, remote: string, filePath: string) => Promise<"keep-local" | "keep-remote" | "open-in-editor">;
+  createFolder: (folderPath: string) => Promise<void>;
+  /** Re-mark a file dirty so it is picked up by the next sync cycle. */
+  markDirty: (filePath: string) => void;
+  promptConflict: (local: string, remote: string, filePath: string) => Promise<"keep-local" | "keep-remote" | "open-in-editor" | "skip">;
   promptRemoteDeletion: (filePath: string) => Promise<"yes" | "no" | "ignore">;
+}
+
+export interface ExecutionResult {
+  success: number;
+  failed: number;
+  skipped: number;
+  /** Local paths of failed operations, for re-dirtying. */
+  failedPaths: string[];
 }
 
 export class SyncExecutor {
@@ -43,17 +58,30 @@ export class SyncExecutor {
     this.deps = deps;
   }
 
-  async executePlan(plan: SyncPlan): Promise<{ success: number; failed: number; skipped: number }> {
-    let success = 0;
-    let failed = 0;
-    let skipped = 0;
+  async executePlan(plan: SyncPlan): Promise<ExecutionResult> {
+    const result: ExecutionResult = {
+      success: 0,
+      failed: 0,
+      skipped: 0,
+      failedPaths: [],
+    };
 
     for (const op of plan.operations) {
       try {
+        if (op.type === "SKIP") {
+          result.skipped++;
+          this.deps.syncLog.log(
+            "SKIP",
+            op.localPath,
+            "Path conflict: an untracked local file and a new remote doc share this path. Rename one of them."
+          );
+          continue;
+        }
         await this.executeOperation(op);
-        success++;
+        result.success++;
       } catch (err: any) {
-        failed++;
+        result.failed++;
+        result.failedPaths.push(op.localPath);
         this.deps.syncLog.log(
           "ERROR",
           op.localPath,
@@ -63,7 +91,7 @@ export class SyncExecutor {
       }
     }
 
-    return { success, failed, skipped };
+    return result;
   }
 
   private async executeOperation(op: SyncOperation): Promise<void> {
@@ -103,8 +131,8 @@ export class SyncExecutor {
     try {
       batchRequest = markdownToGoogleDoc(transformedBody);
     } catch {
-      // Conversion failed — push as plain text
-      batchRequest = markdownToGoogleDoc(body);
+      // Conversion failed — push the body as a single plain-text insert.
+      batchRequest = this.plainTextRequest(body);
       conversionFailed = true;
       this.deps.syncLog.log("CONVERSION_FAIL", op.localPath, "Pushed as plain text");
       new Notice(`Conversion failed for '${op.localPath}' — synced as plain text.`);
@@ -113,36 +141,37 @@ export class SyncExecutor {
     const entry = this.deps.indexManager.getFile(op.syncId);
     if (!entry) return;
 
-    await this.deps.docsApi.clearAndUpdate(entry.googleDocId, batchRequest);
+    await this.deps.docsApi.clearAndUpdate(entry.driveFileId, batchRequest);
 
-    // Store frontmatter as doc properties
+    // Store frontmatter as doc properties.
     if (frontmatter) {
-      const props = frontmatterToDocProperties(frontmatter);
-      await this.deps.driveApi.updateFileMetadata(entry.driveFileId, {
-        properties: props,
-      });
+      await this.pushFrontmatterProperties(op.localPath, entry.driveFileId, frontmatter);
     }
 
-    // Post-push hash check
+    const remoteModifiedTime = await this.fetchRemoteModifiedTime(entry.driveFileId);
+
+    // Post-push hash check: if the file changed while we were pushing,
+    // re-dirty it so the next cycle pushes the newer content.
     const postContent = await this.deps.readFile(op.localPath);
     const postHash = sha256(postContent);
 
-    // Save ancestor snapshot
+    // The ancestor must reflect what was actually pushed, not the newer
+    // local content.
     await this.saveAncestor(op.syncId, content);
 
-    // Update index
     this.deps.indexManager.updateFile(op.syncId, {
-      localContentHash: postHash,
-      remoteContentHash: postHash,
+      localContentHash: preHash,
+      remoteContentHash: preHash,
+      lastRemoteModifiedTime: remoteModifiedTime,
       lastSyncTimestamp: new Date().toISOString(),
       conversionFailed,
     });
 
     this.deps.syncLog.log("PUSH", op.localPath, "OK");
 
-    // Return whether file changed during push (caller can re-dirty)
     if (postHash !== preHash) {
-      this.deps.syncLog.log("PUSH", op.localPath, "File changed during push, will re-sync");
+      this.deps.markDirty(op.localPath);
+      this.deps.syncLog.log("PUSH", op.localPath, "File changed during push, re-queued");
     }
   }
 
@@ -150,10 +179,10 @@ export class SyncExecutor {
     const entry = this.deps.indexManager.getFile(op.syncId);
     if (!entry) return;
 
-    const doc = await this.deps.docsApi.getDocument(entry.googleDocId);
+    const doc = await this.deps.docsApi.getDocument(entry.driveFileId);
     const markdown = googleDocToMarkdown(doc);
 
-    // Restore frontmatter from doc properties
+    // Restore frontmatter from doc properties.
     const driveFile = await this.deps.driveApi.getFile(entry.driveFileId);
     const frontmatter = docPropertiesToFrontmatter(driveFile.properties || {});
     const fullContent = prependFrontmatter(markdown, frontmatter);
@@ -166,6 +195,7 @@ export class SyncExecutor {
     this.deps.indexManager.updateFile(op.syncId, {
       localContentHash: newHash,
       remoteContentHash: newHash,
+      lastRemoteModifiedTime: driveFile.modifiedTime,
       lastSyncTimestamp: new Date().toISOString(),
     });
 
@@ -178,7 +208,7 @@ export class SyncExecutor {
 
     const localContent = await this.deps.readFile(op.localPath);
 
-    const doc = await this.deps.docsApi.getDocument(entry.googleDocId);
+    const doc = await this.deps.docsApi.getDocument(entry.driveFileId);
     const remoteMarkdown = googleDocToMarkdown(doc);
     const driveFile = await this.deps.driveApi.getFile(entry.driveFileId);
     const remoteFrontmatter = docPropertiesToFrontmatter(driveFile.properties || {});
@@ -202,7 +232,14 @@ export class SyncExecutor {
       );
       const result = applyResolution(resolution, localContent, remoteContent);
       if (result === null) {
-        this.deps.syncLog.log("CONFLICT", op.localPath, "Opened in editor");
+        // "open-in-editor" or "skip": leave both sides untouched. The file
+        // stays dirty so the conflict resurfaces next cycle.
+        this.deps.markDirty(op.localPath);
+        this.deps.syncLog.log(
+          "CONFLICT",
+          op.localPath,
+          resolution === "open-in-editor" ? "Opened in editor" : "Skipped"
+        );
         return;
       }
       resolvedContent = result;
@@ -215,14 +252,13 @@ export class SyncExecutor {
     const { frontmatter, body } = extractFrontmatter(resolvedContent);
     const transformedBody = transformAllObsidianSyntax(body);
     const batchRequest = markdownToGoogleDoc(transformedBody);
-    await this.deps.docsApi.clearAndUpdate(entry.googleDocId, batchRequest);
+    await this.deps.docsApi.clearAndUpdate(entry.driveFileId, batchRequest);
 
     if (frontmatter) {
-      const props = frontmatterToDocProperties(frontmatter);
-      await this.deps.driveApi.updateFileMetadata(entry.driveFileId, {
-        properties: props,
-      });
+      await this.pushFrontmatterProperties(op.localPath, entry.driveFileId, frontmatter);
     }
+
+    const remoteModifiedTime = await this.fetchRemoteModifiedTime(entry.driveFileId);
 
     const newHash = sha256(resolvedContent);
     await this.saveAncestor(op.syncId, resolvedContent);
@@ -230,6 +266,7 @@ export class SyncExecutor {
     this.deps.indexManager.updateFile(op.syncId, {
       localContentHash: newHash,
       remoteContentHash: newHash,
+      lastRemoteModifiedTime: remoteModifiedTime,
       lastSyncTimestamp: new Date().toISOString(),
     });
   }
@@ -254,7 +291,16 @@ export class SyncExecutor {
       [DOC_PROPERTY_SYNC_ID]: op.syncId,
     };
     if (frontmatter) {
-      Object.assign(properties, frontmatterToDocProperties(frontmatter));
+      try {
+        Object.assign(properties, frontmatterToDocProperties(frontmatter));
+      } catch (err) {
+        if (!(err instanceof FrontmatterTooLargeError)) throw err;
+        this.deps.syncLog.log(
+          "CONVERSION_FAIL",
+          op.localPath,
+          "Frontmatter too large for Drive properties; not stored remotely"
+        );
+      }
     }
     await this.deps.driveApi.updateFileMetadata(driveFile.id, { properties });
 
@@ -262,16 +308,18 @@ export class SyncExecutor {
     const batchRequest = markdownToGoogleDoc(transformedBody);
     await this.deps.docsApi.clearAndUpdate(driveFile.id, batchRequest);
 
+    const remoteModifiedTime = await this.fetchRemoteModifiedTime(driveFile.id);
+
     const hash = sha256(content);
     await this.saveAncestor(op.syncId, content);
 
     this.deps.indexManager.addFile(op.syncId, {
       localPath: op.localPath,
       driveFileId: driveFile.id,
-      googleDocId: driveFile.id,
       lastSyncTimestamp: new Date().toISOString(),
       localContentHash: hash,
       remoteContentHash: hash,
+      lastRemoteModifiedTime: remoteModifiedTime,
       isDirectory: false,
       mimeType: GOOGLE_DOC_MIME_TYPE,
       conversionFailed: false,
@@ -282,22 +330,74 @@ export class SyncExecutor {
   }
 
   private async executeNewRemote(op: SyncOperation): Promise<void> {
-    // Pull new remote file to vault
-    // op.remotePath should have the drive file info
-    this.deps.syncLog.log("PULL", op.localPath, "New remote file pulled");
+    const driveFile = op.driveFile;
+    if (!driveFile) {
+      throw new Error(`NEW_REMOTE operation for ${op.localPath} is missing Drive metadata`);
+    }
+
+    // New remote folder: mirror it locally and register the mapping.
+    if (driveFile.mimeType === GOOGLE_FOLDER_MIME_TYPE) {
+      await this.deps.createFolder(op.localPath);
+      this.deps.indexManager.addFolder(op.localPath, driveFile.id);
+      this.deps.syncLog.log("PULL", op.localPath, "Created folder from Drive");
+      return;
+    }
+
+    const doc = await this.deps.docsApi.getDocument(driveFile.id);
+    const markdown = googleDocToMarkdown(doc);
+    const frontmatter = docPropertiesToFrontmatter(driveFile.properties || {});
+    const fullContent = prependFrontmatter(markdown, frontmatter);
+
+    await this.deps.writeFile(op.localPath, fullContent);
+
+    // Reuse the doc's existing sync ID (e.g. created by another vault) when
+    // present; otherwise stamp ours onto the doc.
+    const existingSyncId = driveFile.properties?.[DOC_PROPERTY_SYNC_ID];
+    const syncId = existingSyncId || op.syncId;
+    if (!existingSyncId) {
+      await this.deps.driveApi.updateFileMetadata(driveFile.id, {
+        properties: { [DOC_PROPERTY_SYNC_ID]: syncId },
+      });
+    }
+
+    const hash = sha256(fullContent);
+    await this.saveAncestor(syncId, fullContent);
+
+    this.deps.indexManager.addFile(syncId, {
+      localPath: op.localPath,
+      driveFileId: driveFile.id,
+      lastSyncTimestamp: new Date().toISOString(),
+      localContentHash: hash,
+      remoteContentHash: hash,
+      lastRemoteModifiedTime: await this.fetchRemoteModifiedTime(driveFile.id),
+      isDirectory: false,
+      mimeType: GOOGLE_DOC_MIME_TYPE,
+      conversionFailed: false,
+      fileSizeBytes: Buffer.byteLength(fullContent),
+    });
+
+    this.deps.syncLog.log("PULL", op.localPath, "Pulled new file from Drive");
   }
 
   private async executeLocalDelete(op: SyncOperation): Promise<void> {
     const entry = this.deps.indexManager.getFile(op.syncId);
     if (!entry) return;
 
-    // Move Google Doc to deleted folder
-    const deletedFolderId = this.deps.indexManager.getIndex().deletedFolderId;
-    if (deletedFolderId) {
-      const rootFolderId = this.deps.indexManager.getIndex().rootFolderId;
-      await this.deps.driveApi.moveFile(entry.driveFileId, deletedFolderId, rootFolderId);
-    } else {
-      await this.deps.driveApi.deleteFile(entry.driveFileId);
+    try {
+      const deletedFolderId = this.deps.indexManager.getIndex().deletedFolderId;
+      if (deletedFolderId) {
+        const oldParentId = this.parentFolderIdFor(entry.localPath);
+        await this.deps.driveApi.moveFile(entry.driveFileId, deletedFolderId, oldParentId);
+      } else {
+        await this.deps.driveApi.deleteFile(entry.driveFileId);
+      }
+    } catch (err) {
+      if (err instanceof DriveFileNotFoundError) {
+        // Already gone remotely — still clean up our bookkeeping below.
+        this.deps.syncLog.log("DELETE", op.localPath, "Remote file already deleted");
+      } else {
+        throw err;
+      }
     }
 
     this.deps.indexManager.removeFile(op.syncId);
@@ -326,21 +426,96 @@ export class SyncExecutor {
     const entry = this.deps.indexManager.getFile(op.syncId);
     if (!entry) return;
 
+    let remoteModifiedTime = entry.lastRemoteModifiedTime;
+
     if (op.type === "LOCAL_RENAME") {
-      // Rename in Drive
+      // Rename in Drive.
       const newName = op.newPath.split("/").pop()?.replace(/\.md$/, "") || "Untitled";
-      await this.deps.driveApi.updateFileMetadata(entry.driveFileId, { name: newName });
+      const updated = await this.deps.driveApi.updateFileMetadata(entry.driveFileId, {
+        name: newName,
+      });
+      remoteModifiedTime = updated.modifiedTime;
+
+      // Moved across folders? Reparent the Drive file too.
+      const oldDir = this.dirOf(op.localPath);
+      const newDir = this.dirOf(op.newPath);
+      if (oldDir !== newDir) {
+        const newParentId = await this.ensureParentFolder(op.newPath);
+        const oldParentId = this.parentFolderIdFor(op.localPath);
+        const moved = await this.deps.driveApi.moveFile(
+          entry.driveFileId,
+          newParentId,
+          oldParentId
+        );
+        remoteModifiedTime = moved.modifiedTime;
+      }
     } else {
       // Rename locally
       await this.deps.renameFile(op.localPath, op.newPath);
+      remoteModifiedTime = op.driveFile?.modifiedTime ?? remoteModifiedTime;
     }
 
     this.deps.indexManager.updateFile(op.syncId, {
       localPath: op.newPath,
+      lastRemoteModifiedTime: remoteModifiedTime,
       lastSyncTimestamp: new Date().toISOString(),
     });
 
     this.deps.syncLog.log("RENAME", op.localPath, `Renamed to ${op.newPath}`);
+  }
+
+  // ============================================================
+  // Helpers
+  // ============================================================
+
+  private plainTextRequest(body: string): BatchUpdateRequest {
+    if (!body || body.trim() === "") {
+      return { requests: [] };
+    }
+    return {
+      requests: [
+        { insertText: { text: body, location: { index: 1 } } },
+      ],
+    };
+  }
+
+  private async pushFrontmatterProperties(
+    localPath: string,
+    driveFileId: string,
+    frontmatter: string
+  ): Promise<void> {
+    try {
+      const props = frontmatterToDocProperties(frontmatter);
+      await this.deps.driveApi.updateFileMetadata(driveFileId, {
+        properties: props,
+      });
+    } catch (err) {
+      if (!(err instanceof FrontmatterTooLargeError)) throw err;
+      this.deps.syncLog.log(
+        "CONVERSION_FAIL",
+        localPath,
+        "Frontmatter too large for Drive properties; not stored remotely"
+      );
+    }
+  }
+
+  private async fetchRemoteModifiedTime(driveFileId: string): Promise<string> {
+    const file = await this.deps.driveApi.getFile(driveFileId, "id,modifiedTime");
+    return file.modifiedTime;
+  }
+
+  private dirOf(filePath: string): string {
+    const idx = filePath.lastIndexOf("/");
+    return idx === -1 ? "" : filePath.substring(0, idx);
+  }
+
+  private parentFolderIdFor(localPath: string): string {
+    const dir = this.dirOf(localPath);
+    if (!dir) return this.deps.indexManager.getIndex().rootFolderId;
+    return (
+      this.deps.indexManager.getFolder(dir) ??
+      this.deps.indexManager.getIndex().rootFolderId
+    );
   }
 
   private async ensureParentFolder(localPath: string): Promise<string> {

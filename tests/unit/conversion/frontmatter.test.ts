@@ -3,11 +3,13 @@ import {
   prependFrontmatter,
   frontmatterToDocProperties,
   docPropertiesToFrontmatter,
+  FrontmatterTooLargeError,
 } from "@/conversion/frontmatter";
 import {
   DOC_PROPERTY_FRONTMATTER,
   DOC_PROPERTY_FRONTMATTER_PREFIX,
-  MAX_FRONTMATTER_PROPERTY_SIZE,
+  DRIVE_PROPERTY_MAX_BYTES,
+  MAX_FRONTMATTER_CHUNKS,
 } from "@/constants";
 
 // ---------------------------------------------------------------------------
@@ -151,30 +153,50 @@ describe("frontmatterToDocProperties", () => {
     expect(props[DOC_PROPERTY_FRONTMATTER]).toBe(fm);
   });
 
-  it("splits large frontmatter (>30KB) across numbered properties", () => {
-    // Create frontmatter larger than MAX_FRONTMATTER_PROPERTY_SIZE.
-    const line = "key: " + "x".repeat(1000) + "\n";
-    const lines = Array(35).fill(line).join("");
+  it("splits frontmatter exceeding one property across numbered properties", () => {
+    // Drive properties hold at most 124 bytes of key+value, so anything
+    // beyond ~100 bytes of frontmatter must be chunked.
+    const line = "key: " + "x".repeat(100) + "\n";
+    const lines = Array(5).fill(line).join("");
     const fm = "---\n" + lines + "---\n";
-
-    expect(fm.length).toBeGreaterThan(MAX_FRONTMATTER_PROPERTY_SIZE);
 
     const props = frontmatterToDocProperties(fm);
 
     // Should NOT have the single key.
     expect(props[DOC_PROPERTY_FRONTMATTER]).toBeUndefined();
 
-    // Should have numbered keys.
+    // Should have numbered keys, each within Drive's per-property limit.
     const keys = Object.keys(props).sort();
     expect(keys.length).toBeGreaterThan(1);
     for (const key of keys) {
       expect(key).toMatch(
         new RegExp(`^${DOC_PROPERTY_FRONTMATTER_PREFIX}\\d+$`),
       );
-      expect(props[key].length).toBeLessThanOrEqual(
-        MAX_FRONTMATTER_PROPERTY_SIZE,
-      );
+      expect(
+        Buffer.byteLength(key, "utf-8") + Buffer.byteLength(props[key], "utf-8"),
+      ).toBeLessThanOrEqual(DRIVE_PROPERTY_MAX_BYTES);
     }
+  });
+
+  it("keeps every chunk within the byte budget for multi-byte characters", () => {
+    const fm = "---\ntitle: " + "héllo wörld 你好 ".repeat(20) + "\n---\n";
+    const props = frontmatterToDocProperties(fm);
+
+    for (const [key, value] of Object.entries(props)) {
+      expect(
+        Buffer.byteLength(key, "utf-8") + Buffer.byteLength(value, "utf-8"),
+      ).toBeLessThanOrEqual(DRIVE_PROPERTY_MAX_BYTES);
+    }
+    expect(docPropertiesToFrontmatter(props)).toBe(fm);
+  });
+
+  it("throws FrontmatterTooLargeError when the chunk cap is exceeded", () => {
+    const maxTotalBytes = MAX_FRONTMATTER_CHUNKS * DRIVE_PROPERTY_MAX_BYTES;
+    const fm = "---\nbig: " + "x".repeat(maxTotalBytes) + "\n---\n";
+
+    expect(() => frontmatterToDocProperties(fm)).toThrow(
+      FrontmatterTooLargeError,
+    );
   });
 });
 
@@ -196,8 +218,8 @@ describe("docPropertiesToFrontmatter", () => {
   });
 
   it("reassembles split frontmatter from numbered properties", () => {
-    const line = "key: " + "x".repeat(1000) + "\n";
-    const lines = Array(35).fill(line).join("");
+    const line = "key: " + "x".repeat(100) + "\n";
+    const lines = Array(8).fill(line).join("");
     const fm = "---\n" + lines + "---\n";
 
     const props = frontmatterToDocProperties(fm);
@@ -233,8 +255,8 @@ describe("round-trip: extract -> toDocProperties -> fromDocProperties -> prepend
     expect(result).toBe(original);
   });
 
-  it("produces the original document for large frontmatter (>30KB)", () => {
-    const bigValue = "v".repeat(10_000);
+  it("produces the original document for multi-chunk frontmatter", () => {
+    const bigValue = "v".repeat(500);
     const original =
       "---\n" +
       `field1: ${bigValue}\n` +
@@ -243,8 +265,6 @@ describe("round-trip: extract -> toDocProperties -> fromDocProperties -> prepend
       `field4: ${bigValue}\n` +
       "---\n" +
       "Body after large frontmatter.\n";
-
-    expect(original.length).toBeGreaterThan(MAX_FRONTMATTER_PROPERTY_SIZE);
 
     const { frontmatter, body } = extractFrontmatter(original);
     const props = frontmatterToDocProperties(frontmatter);

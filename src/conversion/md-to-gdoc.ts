@@ -85,9 +85,22 @@ export function isListItem(
   line: string,
 ): { ordered: boolean; indent: number; content: string } | null {
   // Matches leading whitespace, then a bullet marker or number marker.
-  const m = line.match(/^(\s*)([-*+]|\d+[.)]) (.*)$/);
+  const m = line.match(/^([ \t]*)([-*+]|\d+[.)]) (.*)$/);
   if (!m) return null;
-  const indent = Math.floor(m[1].length / 2); // each 2-space indent is one nesting level
+  // One tab or two spaces equals one nesting level.
+  let indent = 0;
+  let spaces = 0;
+  for (const ch of m[1]) {
+    if (ch === "\t") {
+      indent += 1;
+    } else {
+      spaces += 1;
+      if (spaces === 2) {
+        indent += 1;
+        spaces = 0;
+      }
+    }
+  }
   const ordered = /\d+[.)]/.test(m[2]);
   return { ordered, indent, content: m[3] };
 }
@@ -235,16 +248,17 @@ export function parseInlineFormatting(text: string): InlineRun[] {
       };
     }
 
-    // Italic (*text* or _text_) -- must be checked after bold
+    // Italic (*text* or _text_) -- must be checked after bold.
+    // Underscore italics require non-word boundaries so snake_case
+    // identifiers are not italicized (matches CommonMark behavior).
     const italicMatch = remaining.match(
-      /(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|(?<!_)_(?!_)(.+?)(?<!_)_(?!_)/,
+      /(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)|(?<![\w_])_(?!_)(.+?)(?<!_)_(?![\w_])/,
     );
     if (
       italicMatch &&
       italicMatch.index !== undefined &&
       italicMatch.index < earliestIdx
     ) {
-      earliestIdx = italicMatch.index;
       const innerText = italicMatch[1] || italicMatch[2];
       matched = {
         run: { text: innerText, italic: true },
@@ -547,24 +561,32 @@ function emitCodeBlock(
 function emitList(ctx: BuildContext, items: ListItem[]): void {
   for (const item of items) {
     const runs = parseInlineFormatting(item.content);
-    const text = runs.map((r) => r.text).join("") + "\n";
+    const plainText = runs.map((r) => r.text).join("");
+    // Leading tabs encode nesting: createParagraphBullets consumes them and
+    // converts each into one bullet nesting level.
+    const tabs = "\t".repeat(item.indent);
+    const text = tabs + plainText + "\n";
     const startIdx = ctx.index;
 
     ctx.requests.push({
       insertText: { text, location: { index: startIdx } },
     });
-    ctx.index += text.length;
 
-    // Apply bullet style.
+    // Apply bullet style over the full inserted range (including tabs).
     const bulletPreset = item.ordered
       ? "NUMBERED_DECIMAL_ALPHA_ROMAN"
       : "BULLET_DISC_CIRCLE_SQUARE";
     ctx.requests.push({
       createParagraphBullets: {
-        range: { startIndex: startIdx, endIndex: ctx.index },
+        range: { startIndex: startIdx, endIndex: startIdx + text.length },
         bulletPreset,
       },
     });
+
+    // After bullet conversion the tabs are removed from the document, so the
+    // item's content starts at startIdx and subsequent indexes shift back by
+    // the number of tabs consumed.
+    ctx.index = startIdx + plainText.length + 1;
 
     // Apply inline formatting.
     applyRunStyles(ctx, startIdx, runs);
@@ -602,10 +624,17 @@ function emitHorizontalRule(ctx: BuildContext): void {
   });
 }
 
-function emitTable(ctx: BuildContext, rows: string[][]): void {
-  const numRows = rows.length;
-  const numCols = rows.length > 0 ? rows[0].length : 0;
+function emitTable(ctx: BuildContext, rawRows: string[][]): void {
+  const numRows = rawRows.length;
+  // Normalize ragged rows: the table is as wide as its widest row, and the
+  // cell index math below requires every row to have exactly numCols cells.
+  const numCols = rawRows.reduce((max, r) => Math.max(max, r.length), 0);
   if (numRows === 0 || numCols === 0) return;
+
+  const rows = rawRows.map((row) => {
+    if (row.length === numCols) return row;
+    return [...row, ...Array(numCols - row.length).fill("")];
+  });
 
   const tableStartIdx = ctx.index;
 

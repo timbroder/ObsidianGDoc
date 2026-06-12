@@ -35,3 +35,23 @@
   background-color: var(--interactive-accent);
   transition: width 0.3s ease;
 }
+
+.gdocs-sync-diff-container {
+  display: flex;
+  gap: 8px;
+}
+
+.gdocs-sync-diff-pane {
+  flex: 1;
+}
+
+.gdocs-sync-button-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.gdocs-sync-log-table {
+  width: 100%;
+  font-size: var(--font-smaller);
+}

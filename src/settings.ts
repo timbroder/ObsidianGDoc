@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type GDocsSyncPlugin from "./main";
 
 export class GDocsSyncSettingTab extends PluginSettingTab {
@@ -14,7 +14,7 @@ export class GDocsSyncSettingTab extends PluginSettingTab {
     containerEl.empty();
 
     // Auth section
-    containerEl.createEl("h2", { text: "Google Cloud Credentials" });
+    new Setting(containerEl).setName("Google Cloud credentials").setHeading();
 
     new Setting(containerEl)
       .setName("Client ID")
@@ -24,7 +24,7 @@ export class GDocsSyncSettingTab extends PluginSettingTab {
           .setPlaceholder("Enter Client ID")
           .setValue(this.plugin.settings.clientId)
           .onChange(async (value) => {
-            this.plugin.settings.clientId = value;
+            this.plugin.settings.clientId = value.trim();
             await this.plugin.saveSettings();
           })
       );
@@ -32,44 +32,65 @@ export class GDocsSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Client Secret")
       .setDesc("OAuth 2.0 Client Secret from your Google Cloud project")
-      .addText((text) =>
+      .addText((text) => {
         text
           .setPlaceholder("Enter Client Secret")
           .setValue(this.plugin.settings.clientSecret)
           .onChange(async (value) => {
-            this.plugin.settings.clientSecret = value;
+            this.plugin.settings.clientSecret = value.trim();
             await this.plugin.saveSettings();
-          })
-      );
+          });
+        text.inputEl.type = "password";
+      });
 
     new Setting(containerEl)
-      .setName("Sign In")
-      .setDesc("Authenticate with Google")
+      .setName("Account")
+      .setDesc(
+        this.plugin.isAuthenticated()
+          ? "Signed in to Google."
+          : "Not signed in."
+      )
       .addButton((button) =>
-        button.setButtonText("Sign In").onClick(async () => {
-          // TODO: trigger OAuth flow
-        })
+        button
+          .setButtonText(this.plugin.isAuthenticated() ? "Sign Out" : "Sign In")
+          .setCta()
+          .onClick(async () => {
+            try {
+              if (this.plugin.isAuthenticated()) {
+                await this.plugin.signOut();
+              } else {
+                await this.plugin.signIn();
+              }
+            } catch (err: any) {
+              new Notice(`Google sign-in failed: ${err.message}`);
+            }
+            this.display();
+          })
       );
 
     // Sync root
-    containerEl.createEl("h2", { text: "Sync Settings" });
+    new Setting(containerEl).setName("Sync").setHeading();
 
     new Setting(containerEl)
-      .setName("Google Drive Root Folder")
-      .setDesc("Folder ID of the Google Drive folder to sync with")
+      .setName("Google Drive folder name")
+      .setDesc(
+        "Name of the Drive folder to sync into. Created automatically on " +
+          "first sync (the drive.file scope only allows access to folders " +
+          "this plugin creates). Defaults to your vault name."
+      )
       .addText((text) =>
         text
-          .setPlaceholder("Folder ID or use picker")
-          .setValue(this.plugin.settings.rootFolderId)
+          .setPlaceholder(this.app.vault.getName())
+          .setValue(this.plugin.settings.rootFolderName)
           .onChange(async (value) => {
-            this.plugin.settings.rootFolderId = value;
+            this.plugin.settings.rootFolderName = value.trim();
             await this.plugin.saveSettings();
           })
       );
 
     new Setting(containerEl)
-      .setName("Sync Interval (minutes)")
-      .setDesc("How often to pull changes from Google Drive (0 = disabled)")
+      .setName("Sync interval (minutes)")
+      .setDesc("How often to sync with Google Drive (0 = disabled)")
       .addText((text) =>
         text
           .setPlaceholder("5")
@@ -79,6 +100,7 @@ export class GDocsSyncSettingTab extends PluginSettingTab {
             if (!isNaN(num) && num >= 0) {
               this.plugin.settings.syncIntervalMinutes = num;
               await this.plugin.saveSettings();
+              this.plugin.restartSyncInterval();
             }
           })
       );
@@ -112,7 +134,7 @@ export class GDocsSyncSettingTab extends PluginSettingTab {
       );
 
     // Exclusions
-    containerEl.createEl("h2", { text: "Exclusions" });
+    new Setting(containerEl).setName("Exclusions").setHeading();
 
     new Setting(containerEl)
       .setName("Exclusion patterns")
@@ -131,7 +153,7 @@ export class GDocsSyncSettingTab extends PluginSettingTab {
       );
 
     // Advanced
-    containerEl.createEl("h2", { text: "Advanced" });
+    new Setting(containerEl).setName("Advanced").setHeading();
 
     new Setting(containerEl)
       .setName("Max file size (MB)")

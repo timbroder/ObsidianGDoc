@@ -32,12 +32,16 @@ export const RETRY_DELAYS_MS = [1000, 4000, 16000];
 
 // File limits
 export const DEFAULT_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
-export const MAX_FRONTMATTER_PROPERTY_SIZE = 30_000; // ~30KB per doc property
+
+// Drive custom properties are limited to 124 bytes (UTF-8 key + value
+// combined) per property and ~100 properties per file. Frontmatter is
+// chunked across numbered properties within those limits.
+export const DRIVE_PROPERTY_MAX_BYTES = 124;
+export const MAX_FRONTMATTER_CHUNKS = 50;
 
 // Metadata
 export const SYNC_DIR = ".gdocs-sync";
 export const INDEX_FILE = "index.json";
-export const INDEX_TMP_FILE = "index.json.tmp";
 export const AUTH_FILE = "auth.json";
 export const SYNC_LOG_FILE = "sync.log";
 export const ANCESTORS_DIR = "ancestors";

@@ -5,7 +5,26 @@ import {
   GOOGLE_DOC_MIME_TYPE,
   GOOGLE_FOLDER_MIME_TYPE,
 } from "@/constants";
-import { RateLimiter } from "@/google/rate-limiter";
+import { RateLimiter, RateLimitError } from "@/google/rate-limiter";
+
+/**
+ * Minimal response shape shared by Obsidian's requestUrl and test mocks.
+ * Note: all requestUrl calls in this module MUST pass `throw: false` —
+ * Obsidian throws on status >= 400 by default, which would bypass the
+ * typed error handling (and the rate limiter's 429 retry) entirely.
+ */
+interface ApiResponse {
+  status: number;
+  headers?: Record<string, string>;
+  json: unknown;
+}
+
+function parseRetryAfterSeconds(headers?: Record<string, string>): number | undefined {
+  const value = headers?.["retry-after"] ?? headers?.["Retry-After"];
+  if (!value) return undefined;
+  const seconds = parseInt(value, 10);
+  return isNaN(seconds) ? undefined : seconds;
+}
 
 // ============================================================
 // Error types
@@ -57,7 +76,7 @@ interface DriveListResponse {
 // DriveAPI
 // ============================================================
 
-const DEFAULT_FILE_FIELDS = "id,name,mimeType,parents,modifiedTime,properties,size";
+const DEFAULT_FILE_FIELDS = "id,name,mimeType,parents,modifiedTime,properties,size,trashed";
 const BATCH_BOUNDARY = "batch_boundary_obsidian_gdocs";
 const MAX_BATCH_SIZE = 100;
 
@@ -99,6 +118,7 @@ export class DriveAPI {
       requestUrl({
         url: `${DRIVE_API_BASE}/files?fields=${DEFAULT_FILE_FIELDS}`,
         method: "POST",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
@@ -107,7 +127,7 @@ export class DriveAPI {
       }),
     );
 
-    this.checkResponseError(response.status, response.json, name);
+    this.checkResponseError(response, name);
     return response.json as DriveFile;
   }
 
@@ -129,13 +149,14 @@ export class DriveAPI {
       requestUrl({
         url: `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?fields=${fileFields}`,
         method: "GET",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
         },
       }),
     );
 
-    this.checkResponseError(response.status, response.json, fileId);
+    this.checkResponseError(response, fileId);
     return response.json as DriveFile;
   }
 
@@ -162,13 +183,14 @@ export class DriveAPI {
       requestUrl({
         url: `${DRIVE_API_BASE}/files?${params.toString()}`,
         method: "GET",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
         },
       }),
     );
 
-    this.checkResponseError(response.status, response.json, folderId);
+    this.checkResponseError(response, folderId);
 
     return {
       files: response.json.files || [],
@@ -193,6 +215,33 @@ export class DriveAPI {
   }
 
   /**
+   * List ALL files under a folder, recursing into subfolders. The returned
+   * array includes the folder entries themselves (so callers can mirror the
+   * directory structure), but not the root folder.
+   */
+  async listAllFilesRecursive(rootFolderId: string): Promise<DriveFile[]> {
+    const all: DriveFile[] = [];
+    const pending: string[] = [rootFolderId];
+    const visited = new Set<string>();
+
+    while (pending.length > 0) {
+      const folderId = pending.shift()!;
+      if (visited.has(folderId)) continue; // guard against parent cycles
+      visited.add(folderId);
+
+      const files = await this.listAllFiles(folderId);
+      for (const file of files) {
+        all.push(file);
+        if (file.mimeType === GOOGLE_FOLDER_MIME_TYPE) {
+          pending.push(file.id);
+        }
+      }
+    }
+
+    return all;
+  }
+
+  /**
    * Update file metadata (name, parents, properties, etc.).
    */
   async updateFileMetadata(
@@ -205,6 +254,7 @@ export class DriveAPI {
       requestUrl({
         url: `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?fields=${DEFAULT_FILE_FIELDS}`,
         method: "PATCH",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
@@ -213,7 +263,7 @@ export class DriveAPI {
       }),
     );
 
-    this.checkResponseError(response.status, response.json, fileId);
+    this.checkResponseError(response, fileId);
     return response.json as DriveFile;
   }
 
@@ -237,6 +287,7 @@ export class DriveAPI {
       requestUrl({
         url: `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?${params.toString()}`,
         method: "PATCH",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
@@ -245,7 +296,7 @@ export class DriveAPI {
       }),
     );
 
-    this.checkResponseError(response.status, response.json, fileId);
+    this.checkResponseError(response, fileId);
     return response.json as DriveFile;
   }
 
@@ -259,6 +310,7 @@ export class DriveAPI {
       requestUrl({
         url: `${DRIVE_API_BASE}/files/${encodeURIComponent(fileId)}?fields=${DEFAULT_FILE_FIELDS}`,
         method: "PATCH",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
@@ -267,7 +319,7 @@ export class DriveAPI {
       }),
     );
 
-    this.checkResponseError(response.status, response.json, fileId);
+    this.checkResponseError(response, fileId);
   }
 
   /**
@@ -277,7 +329,7 @@ export class DriveAPI {
     const token = await this.getAccessToken();
     const params = new URLSearchParams({
       pageToken: startPageToken,
-      fields: "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,parents,modifiedTime,properties,size),time)",
+      fields: "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,mimeType,parents,modifiedTime,properties,size,trashed),time)",
       spaces: "drive",
       includeRemoved: "true",
       pageSize: "100",
@@ -287,13 +339,14 @@ export class DriveAPI {
       requestUrl({
         url: `${DRIVE_API_BASE}/changes?${params.toString()}`,
         method: "GET",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
         },
       }),
     );
 
-    this.checkResponseError(response.status, response.json, "changes");
+    this.checkResponseError(response, "changes");
 
     const data = response.json;
     const result: DriveChangeList = {
@@ -315,13 +368,14 @@ export class DriveAPI {
       requestUrl({
         url: `${DRIVE_API_BASE}/changes/startPageToken`,
         method: "GET",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
         },
       }),
     );
 
-    this.checkResponseError(response.status, response.json, "startPageToken");
+    this.checkResponseError(response, "startPageToken");
     return response.json.startPageToken;
   }
 
@@ -363,6 +417,7 @@ export class DriveAPI {
       requestUrl({
         url: "https://www.googleapis.com/batch/drive/v3",
         method: "POST",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": `multipart/mixed; boundary=${BATCH_BOUNDARY}`,
@@ -399,6 +454,7 @@ export class DriveAPI {
       requestUrl({
         url: `https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=${DEFAULT_FILE_FIELDS}`,
         method: "POST",
+        throw: false,
         headers: {
           Authorization: `Bearer ${token}`,
           "Content-Type": `multipart/related; boundary=${boundary}`,
@@ -407,27 +463,30 @@ export class DriveAPI {
       }),
     );
 
-    this.checkResponseError(response.status, response.json, metadata.name as string);
+    this.checkResponseError(response, metadata.name as string);
     return response.json as DriveFile;
   }
 
-  private checkResponseError(
-    status: number,
-    json: unknown,
-    context: string,
-  ): void {
+  private checkResponseError(response: ApiResponse, context: string): void {
+    const { status, json } = response;
+    if (status < 400) {
+      return;
+    }
     if (status === 404) {
       throw new DriveFileNotFoundError(context);
     }
     if (status === 403) {
       throw new DrivePermissionError(context);
     }
-    if (status >= 400) {
-      const message = json && typeof json === "object" && "error" in json
-        ? JSON.stringify((json as { error: unknown }).error)
-        : `HTTP ${status}`;
-      throw new Error(`Drive API error (${status}): ${message}`);
+    if (status === 429) {
+      throw new RateLimitError(parseRetryAfterSeconds(response.headers));
     }
+    const message = json && typeof json === "object" && "error" in json
+      ? JSON.stringify((json as { error: unknown }).error)
+      : `HTTP ${status}`;
+    const error = new Error(`Drive API error (${status}): ${message}`);
+    (error as Error & { status: number }).status = status;
+    throw error;
   }
 
   private parseBatchResponse(responseText: string): BatchResponseEntry[] {

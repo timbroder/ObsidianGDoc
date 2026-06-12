@@ -1,17 +1,21 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { SyncIndex, SyncFileEntry, createEmptyIndex } from "@/types";
-import { SYNC_DIR, INDEX_FILE, INDEX_TMP_FILE } from "@/constants";
+import { SYNC_DIR, INDEX_FILE } from "@/constants";
+import { atomicWriteFile } from "@/utils/atomic-write";
 
 export class IndexManager {
   private indexPath: string;
-  private tmpPath: string;
   private index: SyncIndex;
+
+  // Reverse lookups, kept in sync with index.files. Maps are rebuilt on
+  // load() and maintained incrementally by add/update/remove.
+  private syncIdByPath: Map<string, string> = new Map();
+  private syncIdByDriveId: Map<string, string> = new Map();
 
   constructor(vaultPath: string) {
     const syncDir = path.join(vaultPath, SYNC_DIR);
     this.indexPath = path.join(syncDir, INDEX_FILE);
-    this.tmpPath = path.join(syncDir, INDEX_TMP_FILE);
     this.index = createEmptyIndex();
   }
 
@@ -22,10 +26,12 @@ export class IndexManager {
       if (!this.index.version || !this.index.files) {
         throw new Error("Invalid index format");
       }
+      this.rebuildLookups();
       return this.index;
     } catch (err: any) {
       if (err.code === "ENOENT") {
         this.index = createEmptyIndex();
+        this.rebuildLookups();
         return this.index;
       }
       throw new IndexCorruptedError(
@@ -35,9 +41,9 @@ export class IndexManager {
   }
 
   async save(): Promise<void> {
+    await fs.mkdir(path.dirname(this.indexPath), { recursive: true });
     const data = JSON.stringify(this.index, null, 2);
-    await fs.writeFile(this.tmpPath, data, "utf-8");
-    await fs.rename(this.tmpPath, this.indexPath);
+    await atomicWriteFile(this.indexPath, data);
   }
 
   getIndex(): SyncIndex {
@@ -48,30 +54,22 @@ export class IndexManager {
     return this.index.files[syncId];
   }
 
-  getFileBySyncId(syncId: string): SyncFileEntry | undefined {
-    return this.index.files[syncId];
-  }
-
   getFileByLocalPath(localPath: string): { syncId: string; entry: SyncFileEntry } | undefined {
-    for (const [syncId, entry] of Object.entries(this.index.files)) {
-      if (entry.localPath === localPath) {
-        return { syncId, entry };
-      }
-    }
-    return undefined;
+    const syncId = this.syncIdByPath.get(localPath);
+    if (syncId === undefined) return undefined;
+    return { syncId, entry: this.index.files[syncId] };
   }
 
   getFileByDriveId(driveFileId: string): { syncId: string; entry: SyncFileEntry } | undefined {
-    for (const [syncId, entry] of Object.entries(this.index.files)) {
-      if (entry.driveFileId === driveFileId) {
-        return { syncId, entry };
-      }
-    }
-    return undefined;
+    const syncId = this.syncIdByDriveId.get(driveFileId);
+    if (syncId === undefined) return undefined;
+    return { syncId, entry: this.index.files[syncId] };
   }
 
   addFile(syncId: string, entry: SyncFileEntry): void {
     this.index.files[syncId] = entry;
+    this.syncIdByPath.set(entry.localPath, syncId);
+    this.syncIdByDriveId.set(entry.driveFileId, syncId);
   }
 
   updateFile(syncId: string, updates: Partial<SyncFileEntry>): void {
@@ -79,10 +77,23 @@ export class IndexManager {
     if (!existing) {
       throw new Error(`File not found in index: ${syncId}`);
     }
+    if (updates.localPath !== undefined && updates.localPath !== existing.localPath) {
+      this.syncIdByPath.delete(existing.localPath);
+      this.syncIdByPath.set(updates.localPath, syncId);
+    }
+    if (updates.driveFileId !== undefined && updates.driveFileId !== existing.driveFileId) {
+      this.syncIdByDriveId.delete(existing.driveFileId);
+      this.syncIdByDriveId.set(updates.driveFileId, syncId);
+    }
     this.index.files[syncId] = { ...existing, ...updates };
   }
 
   removeFile(syncId: string): void {
+    const existing = this.index.files[syncId];
+    if (existing) {
+      this.syncIdByPath.delete(existing.localPath);
+      this.syncIdByDriveId.delete(existing.driveFileId);
+    }
     delete this.index.files[syncId];
   }
 
@@ -96,6 +107,14 @@ export class IndexManager {
 
   getFolder(folderPath: string): string | undefined {
     return this.index.folders[folderPath];
+  }
+
+  /** Reverse lookup: Drive folder ID -> local folder path. */
+  getFolderPathByDriveId(driveFolderId: string): string | undefined {
+    for (const [folderPath, id] of Object.entries(this.index.folders)) {
+      if (id === driveFolderId) return folderPath;
+    }
+    return undefined;
   }
 
   getFilesInFolder(folderPath: string): { syncId: string; entry: SyncFileEntry }[] {
@@ -140,6 +159,15 @@ export class IndexManager {
 
   getFileCount(): number {
     return Object.keys(this.index.files).length;
+  }
+
+  private rebuildLookups(): void {
+    this.syncIdByPath.clear();
+    this.syncIdByDriveId.clear();
+    for (const [syncId, entry] of Object.entries(this.index.files)) {
+      this.syncIdByPath.set(entry.localPath, syncId);
+      this.syncIdByDriveId.set(entry.driveFileId, syncId);
+    }
   }
 }
 

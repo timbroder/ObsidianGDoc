@@ -207,7 +207,7 @@ export class Plugin {
   async saveData(_data: any): Promise<void> {}
 }
 
-export function requestUrl(options: {
+export function requestUrl(_options: {
   url: string;
   method?: string;
   headers?: Record<string, string>;

@@ -18,9 +18,7 @@ export class SyncLogModal extends Modal {
       return;
     }
 
-    const table = contentEl.createEl("table");
-    table.style.width = "100%";
-    table.style.fontSize = "var(--font-smaller)";
+    const table = contentEl.createEl("table", { cls: "gdocs-sync-log-table" });
 
     const header = table.createEl("tr");
     header.createEl("th", { text: "Time" });
